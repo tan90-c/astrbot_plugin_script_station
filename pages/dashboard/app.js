@@ -4,6 +4,7 @@ await bridge.ready();
 
 // ---------- 状态 ----------
 let projects = [];
+let baseDir = null;               // 默认目录 data/plugin_data/<插件名>
 let active = "home";              // 'home' | project id
 let currentFile = null;           // 项目内相对路径
 const fileStates = {};            // `${pid}|${rel}` -> {code, dirty}
@@ -139,28 +140,31 @@ $("btnAddProj").onclick = async () => {
   const name = $("projName").value.trim();
   const path = $("projPath").value.trim();
   if (!name) return toast("请填写项目名", "err");
-  if (!path) return toast("请填写或浏览选择文件夹路径", "err");
+  // 路径留空：服务端在默认目录下按项目名自动建文件夹
   try {
     const r = await apiPost("projects/save", { project: { name, path } });
     $("projName").value = ""; $("projPath").value = "";
-    toast("项目已创建");
+    toast(path ? "项目已创建" : "已在默认目录创建项目文件夹");
     await refresh();
     if (r.id) switchTab(r.id);
   } catch {}
 };
 
 // ---------- 目录浏览 ----------
-let browseAt = null, browseParent = undefined;
+let browseAt = null, browseParent = undefined, browseAtBase = false;
 async function openBrowse() {
   $("browseMask").style.display = "flex";
-  await browseTo(null);
+  await browseTo(null);   // 默认从 plugin_data 目录开始
 }
 async function browseTo(path) {
   try {
-    const r = await apiPost("browse", { path });
-    browseAt = r.at; browseParent = r.parent;
-    $("browsePath").textContent = r.at || "（选择盘符）";
+    const r = await apiPost("browse", path === null ? {} : { path });
+    browseAt = r.at; browseParent = r.parent; browseAtBase = !!r.at_base;
+    baseDir = r.base || baseDir;
+    $("browsePath").textContent = (r.at || "（选择盘符）") + (r.at_base ? "　【默认目录】" : "");
     $("brUp").disabled = !r.parent;
+    $("btnMkDir").disabled = !r.at;
+    $("brPick").disabled = !r.at;
     const box = $("browseList");
     box.innerHTML = "";
     if (!r.dirs.length) {
@@ -178,6 +182,18 @@ async function browseTo(path) {
 }
 $("btnBrowse").onclick = openBrowse;
 $("brUp").onclick = () => { if (browseParent) browseTo(browseParent); };
+$("brHome").onclick = () => browseTo(null);
+$("brDrives").onclick = () => browseTo("");
+$("btnMkDir").onclick = async () => {
+  const name = $("brNewName").value.trim();
+  if (!name) return toast("请输入新文件夹名", "err");
+  try {
+    const r = await apiPost("mkdir", { path: browseAt, name });
+    $("brNewName").value = "";
+    toast("已创建，进入：" + r.path);
+    await browseTo(r.path);
+  } catch {}
+};
 $("brCancel").onclick = () => { $("browseMask").style.display = "none"; };
 $("brPick").onclick = () => {
   if (!browseAt) return toast("请先进入一个文件夹", "err");
@@ -445,6 +461,10 @@ async function refresh() {
     const res = await bridge.apiGet("projects");
     if (!res || !res.ok) return;
     projects = res.projects || [];
+    if (res.base) {
+      baseDir = res.base;
+      $("projPath").placeholder = "留空=在默认目录创建：" + baseDir;
+    }
     renderTabs();
     if (active === "home") renderProjTable();
     else {

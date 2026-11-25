@@ -111,11 +111,11 @@ textarea.code{width:100%;min-height:260px;font-family:Consolas,Menlo,monospace;f
         <h2>添加项目（本机文件夹）</h2>
         <div class="toolbar">
           <input id="projName" placeholder="项目名，如：点赞统计" style="width:200px" maxlength="64" />
-          <input id="projPath" placeholder="文件夹绝对路径，如 E:\pyprojects\demo" style="flex:1;min-width:260px" />
+          <input id="projPath" placeholder="留空=在默认目录自动创建；或输入/浏览选择文件夹路径" style="flex:1;min-width:260px" />
           <button class="btn small secondary" id="btnBrowse">浏览…</button>
           <button class="btn small" id="btnAddProj">创建并打开</button>
         </div>
-        <div class="hint" style="margin-top:6px">面板与 AstrBot 在同一台机器上，路径填 AstrBot 进程可访问的目录；脚本依赖需装在 AstrBot 的 Python 环境</div>
+        <div class="hint" style="margin-top:6px" id="addHint">默认目录：data/plugin_data/astrbot_plugin_script_station（浏览与新建项目都从这里开始，统一管理；也可选本机任意文件夹）</div>
       </div>
       <div class="card">
         <h2>项目列表</h2>
@@ -175,7 +175,13 @@ textarea.code{width:100%;min-height:260px;font-family:Consolas,Menlo,monospace;f
 <!-- 目录浏览 -->
 <div id="browseMask"><div class="dlg">
   <h2 style="font-size:14px;margin:0 0 4px">选择项目文件夹</h2>
-  <div class="toolbar"><button class="btn small secondary" id="brUp">↑ 上级</button><span class="hint" style="margin-left:auto">点击文件夹进入</span></div>
+  <div class="toolbar">
+    <button class="btn small secondary" id="brUp">↑ 上级</button>
+    <button class="btn small secondary" id="brHome">🏠 默认目录</button>
+    <button class="btn small secondary" id="brDrives">💽 盘符</button>
+    <input id="brNewName" placeholder="新文件夹名" style="width:130px" maxlength="50" />
+    <button class="btn small" id="btnMkDir">＋建文件夹</button>
+  </div>
   <div id="browsePath"></div>
   <div id="browseList"></div>
   <div class="row" style="justify-content:flex-end">

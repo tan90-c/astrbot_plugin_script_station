@@ -64,7 +64,7 @@ except ImportError:  # 部分版本无 astrbot.api.web：Quart 回退
     request = _ReqProxy()
 
 PLUGIN_ID = "astrbot_plugin_script_station"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 MAX_NAME = 64
 MAX_FILE_BYTES = 200_000   # 单脚本读/写上限
@@ -73,6 +73,7 @@ MAX_TREE_FILES = 800       # 文件树最多返回文件数
 MAX_TREE_DEPTH = 6
 MAX_BROWSE_DIRS = 400
 ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
+MK_NAME_RE = re.compile(r'^[^\\/:*?"<>|]{1,50}$')
 SKIP_DIRS = {
     "__pycache__", ".git", ".svn", ".hg", "node_modules", ".venv", "venv",
     "env", ".idea", ".vscode", "dist", "build", ".tox", ".mypy_cache",
@@ -138,6 +139,7 @@ class ScriptStation(Star):
             a(f"/{PLUGIN_ID}/projects/save", self.web_save_project, ["POST"], "新增/更新项目")
             a(f"/{PLUGIN_ID}/projects/delete", self.web_delete_project, ["POST"], "删除项目(不删文件)")
             a(f"/{PLUGIN_ID}/browse", self.web_browse, ["POST"], "浏览本机目录")
+            a(f"/{PLUGIN_ID}/mkdir", self.web_mkdir, ["POST"], "新建子文件夹")
             a(f"/{PLUGIN_ID}/files", self.web_files, ["POST"], "项目内 .py 文件树")
             a(f"/{PLUGIN_ID}/read_file", self.web_read_file, ["POST"], "读取脚本")
             a(f"/{PLUGIN_ID}/write_file", self.web_write_file, ["POST"], "保存脚本")
@@ -149,6 +151,27 @@ class ScriptStation(Star):
             logger.warning("[%s] 当前 AstrBot 不支持 register_web_api，面板不可用", PLUGIN_ID)
 
     # ================= 配置与校验 =================
+
+    def _base_dir(self) -> str:
+        """默认工作目录 data/plugin_data/<插件名>，浏览/新建项目均从这里开始。"""
+        base = getattr(self, "_base_cached", None)
+        if not base:
+            cp = ""
+            try:
+                cp = str(getattr(self.config, "config_path", "") or "")
+            except Exception:
+                cp = ""
+            if cp:
+                data_dir = os.path.dirname(os.path.dirname(os.path.abspath(cp)))
+            else:
+                data_dir = os.path.abspath(os.path.join(os.getcwd(), "data"))
+            base = os.path.join(data_dir, "plugin_data", PLUGIN_ID)
+            self._base_cached = base
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            pass
+        return base
 
     def _cfg_projects(self) -> list:
         v = self.config.get("projects")
@@ -367,7 +390,8 @@ class ScriptStation(Star):
                 "status": con.status() if con else {
                     "running": 0, "procs": [], "lines": 0, "cursor": 0},
             })
-        return json_response({"ok": True, "projects": items, "version": VERSION})
+        return json_response({"ok": True, "projects": items, "base": self._base_dir(),
+                              "version": VERSION})
 
     async def web_save_project(self):
         body = await self._body()
@@ -390,7 +414,13 @@ class ScriptStation(Star):
             return error_response(f"项目名称不能超过 {MAX_NAME} 个字符")
         path = str(raw.get("path") or "").strip().strip('"')
         if not path:
-            return error_response("项目路径不能为空")
+            # 路径留空：在默认目录 data/plugin_data/<插件名> 下按项目名自动创建
+            safe = re.sub(r'[\\/:*?"<>|]', "_", name)[:50]
+            path = os.path.join(self._base_dir(), safe)
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as e:
+                return error_response(f"自动创建目录失败: {e}")
         if not os.path.isdir(path):
             return error_response(f"路径不存在或不是文件夹: {path}")
         auto = raw.get("autoRun", keep.get("autoRun", []) if keep else [])
@@ -446,13 +476,19 @@ class ScriptStation(Star):
 
     async def web_browse(self):
         body = await self._body() or {}
+        base = self._base_dir()
         path = body.get("path")
-        if not isinstance(path, str) or not path:
+        if path is None:
+            path = base
+        if not isinstance(path, str):
+            return error_response("path 必须是字符串")
+        if not path:
             if os.name == "nt":
                 dirs = [{"name": f"{c}:\\", "path": f"{c}:\\"}
                         for c in "CDEFGHIJKLMNOPQRSTUVWXYZ"
                         if os.path.exists(f"{c}:\\")]
-                return json_response({"ok": True, "at": "", "parent": None, "dirs": dirs})
+                return json_response({"ok": True, "at": "", "parent": None, "base": base,
+                                      "at_base": False, "dirs": dirs})
             path = "/"
         path = path.rstrip("\\/") or path
         if not os.path.isdir(path):
@@ -470,10 +506,33 @@ class ScriptStation(Star):
             return error_response(f"无权限访问: {path}")
         dirs.sort(key=lambda d: d["name"].lower())
         parent = os.path.dirname(path)
-        if parent == path:
+        at_base = os.path.realpath(path) == os.path.realpath(base)
+        if parent == path or at_base:
             parent = None
-        return json_response({"ok": True, "at": path, "parent": parent,
-                              "dirs": dirs[:MAX_BROWSE_DIRS]})
+        return json_response({"ok": True, "at": path, "parent": parent, "base": base,
+                              "at_base": at_base, "dirs": dirs[:MAX_BROWSE_DIRS]})
+
+    async def web_mkdir(self):
+        body = await self._body()
+        if body is None:
+            return error_response("请求体必须是 JSON 对象")
+        base = self._base_dir()
+        path = body.get("path")
+        if not isinstance(path, str) or not path:
+            path = base
+        if not os.path.isdir(path):
+            return error_response(f"父目录不存在: {path}")
+        name = str(body.get("name") or "").strip()
+        if not MK_NAME_RE.match(name) or name in (".", ".."):
+            return error_response("文件夹名称非法（不能含 \\ / : * ? \" < > |，长度 1-50）")
+        new = os.path.join(path, name)
+        if os.path.exists(new):
+            return error_response(f"已存在: {new}")
+        try:
+            os.makedirs(new)
+        except OSError as e:
+            return error_response(f"创建失败: {e}")
+        return json_response({"ok": True, "path": new})
 
     async def _require_project(self, body):
         pid = body.get("id")
