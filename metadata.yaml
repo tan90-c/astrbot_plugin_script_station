@@ -1,8 +1,8 @@
 name: astrbot_plugin_script_station
 display_name: 脚本挂机面板
-desc: 可视化面板管理 Python 脚本：首页添加脚本，每个脚本独立标签页，支持启动/停止常驻脚本（如 app.run 的 Flask 服务）并实时查看控制台输出。
+desc: 项目文件夹式脚本挂机面板：选择本机项目目录，文件树点开 .py 即可编辑/运行/停止，每个项目一个实时控制台，支持 app.run 常驻服务与自动运行。
 author: tan90-c
-version: 1.0.0
+version: 2.0.0
 repo: https://github.com/tan90-c/astrbot_plugin_script_station
 astrbot_version: ">=4.26.0"
 support_platforms:

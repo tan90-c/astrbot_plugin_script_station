@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
-"""astrbot_plugin_script_station — 脚本挂机面板
+"""astrbot_plugin_script_station v2 — 脚本挂机面板（项目文件夹版）
 
-可视化面板管理用户 Python 脚本：
-1. 首页添加/编辑脚本；
-2. 每个脚本一个标签页，可启动/停止；
-3. 标签页内实时查看控制台输出（stdout+stderr 合并）；
-4. 支持 app.run(host=..., port=...) 这类常驻脚本（子进程持续运行，
-   面板轮询增量拉取日志，停止时杀整个进程树）。
+1. 首页添加「项目文件夹」（本机绝对路径，带目录浏览选择器）；
+2. 每个项目一个标签页：左侧 .py 文件树，点文件即可编辑/运行；
+3. 每个项目一个共享控制台：所有运行脚本的 stdout/stderr 汇入，带文件名前缀；
+4. 常驻脚本支持：python -u 子进程持续运行（app.run 等），停止杀进程树；
+5. 自动运行：项目内标记 autoRun 的文件在插件加载时自动拉起。
 
-所有 Web API 路径前缀由 AstrBot 转发为
-/api/v1/plugins/extensions/astrbot_plugin_script_station/<path>。
+脚本文件保存在用户自己的项目目录里（不再存配置）；配置只存项目登记，
+删除项目只停止进程并移除登记，绝不删除用户文件。
 """
 from __future__ import annotations
 
 import asyncio
-import copy
 import os
 import re
-import shutil
 import signal
 import sys
 import time
@@ -34,7 +31,7 @@ except ImportError:  # 部分版本无 astrbot.api.web：Quart 回退
     try:
         from quart import Response as _QR
         from quart import request as _qr
-    except ImportError:  # pragma: no cover - 极端环境，仅让 import 不炸
+    except ImportError:  # pragma: no cover
         _QR = None
         _qr = None
 
@@ -67,77 +64,101 @@ except ImportError:  # 部分版本无 astrbot.api.web：Quart 回退
     request = _ReqProxy()
 
 PLUGIN_ID = "astrbot_plugin_script_station"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RUN_ROOT = os.path.join(BASE_DIR, "run")  # 派生缓存：代码以配置为准，删除脚本时清理
-MAX_CODE_BYTES = 200_000
 MAX_NAME = 64
-MAX_LINES = 3000  # 每个脚本保留的控制台行数（环形丢弃旧行）
+MAX_FILE_BYTES = 200_000   # 单脚本读/写上限
+MAX_LINES = 3000           # 每项目控制台保留行数
+MAX_TREE_FILES = 800       # 文件树最多返回文件数
+MAX_TREE_DEPTH = 6
+MAX_BROWSE_DIRS = 400
 ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
+SKIP_DIRS = {
+    "__pycache__", ".git", ".svn", ".hg", "node_modules", ".venv", "venv",
+    "env", ".idea", ".vscode", "dist", "build", ".tox", ".mypy_cache",
+    ".pytest_cache", "__tmp__",
+}
 
 
-class ScriptRun:
-    """单个脚本的一次运行会话：子进程 + 行缓冲 + 状态。"""
+class ProcHandle:
+    """项目内一次脚本运行。"""
 
-    def __init__(self, script_id: str):
-        self.script_id = script_id
-        self.proc: asyncio.subprocess.Process | None = None
+    def __init__(self, run_id: str, rel_file: str, proc):
+        self.run_id = run_id
+        self.file = rel_file            # 相对项目根的 posix 风格路径
+        self.proc = proc
         self.reader: asyncio.Task | None = None
         self.waiter: asyncio.Task | None = None
-        self.lines: list[dict] = []  # [{seq, t, text}]
-        self.seq = 0                 # 单调递增行号（跨 clear 不回退，便于游标）
-        self.running = False
-        self.stopping = False
-        self.exit_code: int | None = None
-        self.started_at: float = 0.0
+        self.started_at = time.time()
+
+    def brief(self) -> dict:
+        return {
+            "runId": self.run_id,
+            "file": self.file,
+            "pid": self.proc.pid,
+            "startedAt": self.started_at,
+        }
+
+
+class ProjectConsole:
+    """每项目共享控制台缓冲 + 进程集合。"""
+
+    def __init__(self, project_id: str):
+        self.project_id = project_id
+        self.lines: list[dict] = []     # {seq,t,tag,text}
+        self.seq = 0
+        self.procs: dict[str, ProcHandle] = {}
         self.lock = asyncio.Lock()
 
-    def append(self, text: str) -> None:
+    def append(self, tag: str, text: str) -> None:
         self.seq += 1
-        self.lines.append({"seq": self.seq, "t": time.time(), "text": text})
+        self.lines.append({"seq": self.seq, "t": time.time(), "tag": tag, "text": text})
         if len(self.lines) > MAX_LINES:
             del self.lines[: len(self.lines) - MAX_LINES]
 
     def status(self) -> dict:
-        state = "stopped"
-        if self.running:
-            state = "stopping" if self.stopping else "running"
         return {
-            "state": state,
-            "running": self.running,
-            "stopping": self.stopping,
-            "exitCode": self.exit_code,
-            "startedAt": self.started_at,
-            "pid": self.proc.pid if (self.proc and self.running) else None,
+            "running": len(self.procs),
+            "procs": [p.brief() for p in self.procs.values()],
             "lines": len(self.lines),
             "cursor": self.seq,
         }
 
 
-@register(PLUGIN_ID, "tan90-c", "可视化挂机/运行 Python 脚本面板", VERSION,
+@register(PLUGIN_ID, "tan90-c", "项目文件夹式 Python 脚本挂机面板", VERSION,
           "https://github.com/tan90-c/astrbot_plugin_script_station")
 class ScriptStation(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
         self.config = config if config is not None else {}
-        self.runs: dict[str, ScriptRun] = {}
+        self.consoles: dict[str, ProjectConsole] = {}
         if hasattr(context, "register_web_api"):
-            context.register_web_api(f"/{PLUGIN_ID}/scripts", self.web_list, ["GET"], "脚本列表与状态")
-            context.register_web_api(f"/{PLUGIN_ID}/scripts/save", self.web_save_script, ["POST"], "新增/更新脚本")
-            context.register_web_api(f"/{PLUGIN_ID}/scripts/delete", self.web_delete_script, ["POST"], "删除脚本")
-            context.register_web_api(f"/{PLUGIN_ID}/run", self.web_run, ["POST"], "启动脚本")
-            context.register_web_api(f"/{PLUGIN_ID}/stop", self.web_stop, ["POST"], "停止脚本")
-            context.register_web_api(f"/{PLUGIN_ID}/logs", self.web_logs, ["POST"], "增量拉取控制台输出")
-            context.register_web_api(f"/{PLUGIN_ID}/clear_log", self.web_clear_log, ["POST"], "清空控制台缓冲")
-        else:  # pragma: no cover - 旧版无面板 API
+            a = context.register_web_api
+            a(f"/{PLUGIN_ID}/projects", self.web_projects, ["GET"], "项目列表与状态")
+            a(f"/{PLUGIN_ID}/projects/save", self.web_save_project, ["POST"], "新增/更新项目")
+            a(f"/{PLUGIN_ID}/projects/delete", self.web_delete_project, ["POST"], "删除项目(不删文件)")
+            a(f"/{PLUGIN_ID}/browse", self.web_browse, ["POST"], "浏览本机目录")
+            a(f"/{PLUGIN_ID}/files", self.web_files, ["POST"], "项目内 .py 文件树")
+            a(f"/{PLUGIN_ID}/read_file", self.web_read_file, ["POST"], "读取脚本")
+            a(f"/{PLUGIN_ID}/write_file", self.web_write_file, ["POST"], "保存脚本")
+            a(f"/{PLUGIN_ID}/run", self.web_run, ["POST"], "运行脚本文件")
+            a(f"/{PLUGIN_ID}/stop", self.web_stop, ["POST"], "停止一个/全部进程")
+            a(f"/{PLUGIN_ID}/logs", self.web_logs, ["POST"], "增量拉取控制台")
+            a(f"/{PLUGIN_ID}/clear_log", self.web_clear_log, ["POST"], "清空控制台")
+        else:  # pragma: no cover
             logger.warning("[%s] 当前 AstrBot 不支持 register_web_api，面板不可用", PLUGIN_ID)
 
-    # ---------------- 配置读写 ----------------
+    # ================= 配置与校验 =================
 
-    def _cfg_scripts(self) -> list[dict]:
-        v = self.config.get("scripts")
+    def _cfg_projects(self) -> list:
+        v = self.config.get("projects")
         return v if isinstance(v, list) else []
+
+    def _find_project(self, pid: str) -> dict | None:
+        for p in self._cfg_projects():
+            if isinstance(p, dict) and p.get("id") == pid:
+                return p
+        return None
 
     async def _save(self) -> None:
         try:
@@ -149,285 +170,424 @@ class ScriptStation(Star):
             logger.warning("[%s] 配置保存失败: %s", PLUGIN_ID, e)
             raise
 
-    # ---------------- 校验 ----------------
+    @staticmethod
+    def _norm_rel(rel: str) -> str:
+        return str(rel or "").replace("\\", "/").strip("/")
 
-    def _find(self, script_id: str) -> dict | None:
-        for s in self._cfg_scripts():
-            if s.get("id") == script_id:
-                return s
-        return None
+    def _safe_file(self, project: dict, rel: str) -> str:
+        """把相对路径解析为项目内绝对路径；越界/非 .py 抛 ValueError。"""
+        rel = self._norm_rel(rel)
+        if not rel or ".." in rel.split("/"):
+            raise ValueError("非法文件路径")
+        if not rel.endswith(".py"):
+            raise ValueError("只能操作 .py 脚本文件")
+        root = os.path.realpath(project["path"])
+        abs_path = os.path.realpath(os.path.join(root, rel))
+        try:
+            if os.path.commonpath([root, abs_path]) != root:
+                raise ValueError("文件路径越出项目目录")
+        except ValueError:
+            raise ValueError("文件路径越出项目目录")
+        return abs_path
 
-    def _clean_input(self, raw, keep: dict | None) -> dict:
-        if not isinstance(raw, dict):
-            raise ValueError("script 字段必须是对象")
-        sid = raw.get("id")
-        if not (isinstance(sid, str) and ID_RE.match(sid)):
-            sid = keep["id"] if keep else uuid.uuid4().hex[:12]
-        name = str(raw.get("name") or "").strip()
-        if not name:
-            raise ValueError("脚本名称不能为空")
-        if len(name) > MAX_NAME:
-            raise ValueError(f"脚本名称不能超过 {MAX_NAME} 个字符")
-        for s in self._cfg_scripts():
-            if isinstance(s, dict) and s.get("id") != sid and str(s.get("name") or "").strip() == name:
-                raise ValueError(f"已存在同名脚本「{name}」，请换个名称（若刚删除请刷新）")
-        code = raw.get("code")
-        if not isinstance(code, str) or not code.strip():
-            raise ValueError(f"脚本「{name}」的代码不能为空")
-        if len(code.encode("utf-8", "replace")) > MAX_CODE_BYTES:
-            raise ValueError(f"脚本「{name}」代码过大（上限 {MAX_CODE_BYTES // 1000}KB）")
-        now = time.time()
-        return {
-            "id": sid,
-            "name": name,
-            "code": code,
-            "autoStart": bool(raw.get("autoStart", keep.get("autoStart") if keep else False)),
-            "createdAt": keep["createdAt"] if keep else now,
-            "updatedAt": now,
-        }
+    def _console(self, pid: str) -> ProjectConsole:
+        return self.consoles.setdefault(pid, ProjectConsole(pid))
 
-    # ---------------- 生命周期 ----------------
+    # ================= 生命周期 =================
 
     async def initialize(self) -> None:
-        for s in self._cfg_scripts():
-            if s.get("autoStart") and s.get("id"):
+        for proj in self._cfg_projects():
+            if not (isinstance(proj, dict) and proj.get("id")):
+                continue
+            files = proj.get("autoRun")
+            if not (isinstance(files, list) and files):
+                continue
+            if not os.path.isdir(str(proj.get("path", ""))):
+                continue
+            for rel in files:
                 try:
-                    await self._start_script(s)
-                    logger.info("[%s] 已自动启动脚本「%s」", PLUGIN_ID, s.get("name"))
+                    await self._start_file(proj, rel)
+                    logger.info("[%s] 自动运行 %s :: %s", PLUGIN_ID, proj.get("name"), rel)
                 except Exception as e:
-                    logger.warning("[%s] 自动启动「%s」失败: %s", PLUGIN_ID, s.get("name"), e)
+                    logger.warning("[%s] 自动运行失败 %s: %s", PLUGIN_ID, rel, e)
 
     async def terminate(self) -> None:
-        for run in list(self.runs.values()):
-            if run.running:
-                try:
-                    await self._kill_run(run)
-                except Exception:
-                    pass
+        for proj in self._cfg_projects():
+            if isinstance(proj, dict) and proj.get("id"):
+                await self._stop_all(proj["id"], timeout_each=8)
 
-    # ---------------- 进程管理 ----------------
+    # ================= 进程管理 =================
 
-    def _run_dir(self, script_id: str) -> str:
-        return os.path.join(RUN_ROOT, script_id)
-
-    async def _start_script(self, script: dict) -> None:
-        sid = script["id"]
-        run = self.runs.setdefault(sid, ScriptRun(sid))
-        async with run.lock:
-            if run.running:
-                raise ValueError(f"脚本「{script['name']}」已在运行中")
-            d = self._run_dir(sid)
-            os.makedirs(d, exist_ok=True)
-            path = os.path.join(d, "main.py")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(script["code"])
-            # 清掉上次退出的缓冲，开始新会话
-            run.lines.clear()
-            run.exit_code = None
-            run.stopping = False
+    async def _start_file(self, project: dict, rel: str) -> str:
+        rel = self._norm_rel(rel)
+        abs_path = self._safe_file(project, rel)
+        if not os.path.isfile(abs_path):
+            raise ValueError(f"文件不存在: {rel}")
+        pid = project["id"]
+        con = self._console(pid)
+        async with con.lock:
+            for p in con.procs.values():
+                if p.file == rel:
+                    raise ValueError(f"脚本「{rel}」已在运行中 (pid={p.proc.pid})")
             env = dict(os.environ)
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
             kwargs = dict(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=d,
+                cwd=os.path.realpath(project["path"]),
                 env=env,
             )
             if os.name != "nt":
-                kwargs["start_new_session"] = True  # 便于 killpg 杀进程组
+                kwargs["start_new_session"] = True
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-u", "main.py", **kwargs)
+                    sys.executable, "-u", abs_path, **kwargs)
             except FileNotFoundError:
                 raise ValueError(f"找不到 Python 解释器: {sys.executable}")
-            run.proc = proc
-            run.running = True
-            run.started_at = time.time()
-            run.append(f"[面板] 已启动 {sys.executable} -u main.py (pid={proc.pid})")
-            run.reader = asyncio.create_task(self._read_loop(run))
-            run.waiter = asyncio.create_task(self._wait_loop(run))
+            run_id = uuid.uuid4().hex[:8]
+            handle = ProcHandle(run_id, rel, proc)
+            con.procs[run_id] = handle
+            con.append(os.path.basename(rel), f"[面板] 已启动 (pid={proc.pid})")
+            handle.reader = asyncio.create_task(self._read_loop(pid, handle))
+            handle.waiter = asyncio.create_task(self._wait_loop(pid, handle))
+            return run_id
 
-    async def _read_loop(self, run: ScriptRun) -> None:
-        proc = run.proc
+    async def _read_loop(self, pid: str, handle: ProcHandle) -> None:
+        con = self._console(pid)
+        tag = os.path.basename(handle.file)
+        proc = handle.proc
         try:
-            while proc and proc.stdout:
+            while proc.stdout:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                run.append(line.decode("utf-8", "replace").rstrip("\r\n"))
-        except Exception as e:  # 管道异常只记日志，不崩宿主
-            run.append(f"[面板] 读取输出异常: {e}")
+                con.append(tag, line.decode("utf-8", "replace").rstrip("\r\n"))
+        except Exception as e:
+            con.append(tag, f"[面板] 读取输出异常: {e}")
         finally:
-            # 冲刷残留的非换行结尾输出
             try:
-                if proc and proc.stdout:
+                if proc.stdout:
                     rest = await proc.stdout.read()
                     if rest:
                         for part in rest.decode("utf-8", "replace").split("\n"):
                             if part:
-                                run.append(part.rstrip("\r"))
+                                con.append(tag, part.rstrip("\r"))
             except Exception:
                 pass
 
-    async def _wait_loop(self, run: ScriptRun) -> None:
+    async def _wait_loop(self, pid: str, handle: ProcHandle) -> None:
+        con = self._console(pid)
+        tag = os.path.basename(handle.file)
         try:
-            code = await run.proc.wait() if run.proc else -1
+            code = await handle.proc.wait()
         except Exception:
             code = -1
-        run.running = False
-        run.exit_code = code
-        run.append(f"[面板] 进程已退出，返回码 {code}")
+        con.procs.pop(handle.run_id, None)
+        con.append(tag, f"[面板] 进程已退出，返回码 {code}")
 
-    async def _kill_run(self, run: ScriptRun) -> None:
-        proc = run.proc
-        if not proc or proc.returncode is not None:
-            run.running = False
+    async def _kill_proc(self, pid: str, handle: ProcHandle) -> None:
+        proc = handle.proc
+        if proc.returncode is not None:
             return
-        run.stopping = True
-        run.append("[面板] 正在停止进程...")
-        pid = proc.pid
+        tag = os.path.basename(handle.file)
+        self._console(pid).append(tag, "[面板] 正在停止...")
         try:
             if os.name == "nt":
                 killer = await asyncio.create_subprocess_exec(
-                    "taskkill", "/F", "/T", "/PID", str(pid),
+                    "taskkill", "/F", "/T", "/PID", str(proc.pid),
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(killer.wait(), timeout=15)
             else:
                 try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except ProcessLookupError:
                     pass
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     try:
-                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     except ProcessLookupError:
                         pass
         except asyncio.TimeoutError:
             proc.kill()
         except Exception as e:
-            run.append(f"[面板] 停止异常: {e}")
+            self._console(pid).append(tag, f"[面板] 停止异常: {e}")
         try:
             await asyncio.wait_for(proc.wait(), timeout=10)
         except asyncio.TimeoutError:
             pass
-        run.stopping = False
 
-    async def stop_script(self, script_id: str) -> None:
-        run = self.runs.get(script_id)
-        if not run or not run.running:
-            raise ValueError("脚本未在运行中")
-        async with run.lock:
-            await self._kill_run(run)
+    async def _stop_one(self, pid: str, run_id: str) -> None:
+        con = self._console(pid)
+        handle = con.procs.get(run_id)
+        if not handle:
+            raise ValueError("进程不存在或已退出")
+        async with con.lock:
+            handle = con.procs.get(run_id)
+            if not handle:
+                raise ValueError("进程不存在或已退出")
+            await self._kill_proc(pid, handle)
+            con.procs.pop(run_id, None)
 
-    # ---------------- 面板 API ----------------
+    async def _stop_all(self, pid: str, timeout_each: float = 10) -> None:
+        con = self.consoles.get(pid)
+        if not con:
+            return
+        async with con.lock:
+            handles = list(con.procs.values())
+        for h in handles:
+            try:
+                await asyncio.wait_for(self._kill_proc(pid, h), timeout=timeout_each + 15)
+            except Exception:
+                pass
+            con.procs.pop(h.run_id, None)
 
-    async def _body(self) -> dict | None:
+    # ================= 面板 API =================
+
+    async def _body(self):
         payload = await request.json(default=None)
         return payload if isinstance(payload, dict) else None
 
-    async def web_list(self):
+    async def web_projects(self):
         items = []
-        for s in self._cfg_scripts():
-            if not isinstance(s, dict):
+        for p in self._cfg_projects():
+            if not isinstance(p, dict):
                 continue
-            sid = s.get("id", "")
-            run = self.runs.get(sid)
+            path = str(p.get("path", ""))
+            con = self.consoles.get(p.get("id"))
             items.append({
-                "id": sid,
-                "name": s.get("name", ""),
-                "code": s.get("code", ""),
-                "autoStart": bool(s.get("autoStart")),
-                "createdAt": s.get("createdAt"),
-                "updatedAt": s.get("updatedAt"),
-                "status": run.status() if run else {
-                    "state": "stopped", "running": False, "stopping": False,
-                    "exitCode": None, "startedAt": 0, "pid": None,
-                    "lines": 0, "cursor": 0},
+                "id": p.get("id"),
+                "name": p.get("name", ""),
+                "path": path,
+                "autoRun": list(p.get("autoRun") or []),
+                "valid": os.path.isdir(path),
+                "status": con.status() if con else {
+                    "running": 0, "procs": [], "lines": 0, "cursor": 0},
             })
-        return json_response({"ok": True, "scripts": items, "version": VERSION})
+        return json_response({"ok": True, "projects": items, "version": VERSION})
 
-    async def web_save_script(self):
+    async def web_save_project(self):
         body = await self._body()
         if body is None:
             return error_response("请求体必须是 JSON 对象")
-        raw = body.get("script")
+        raw = body.get("project")
+        if not isinstance(raw, dict):
+            return error_response("project 字段必须是对象")
+        pid = raw.get("id")
         keep = None
-        if isinstance(raw, dict) and isinstance(raw.get("id"), str) and ID_RE.match(raw["id"]):
-            keep = self._find(raw["id"])
+        if isinstance(pid, str) and ID_RE.match(pid):
+            keep = self._find_project(pid)
+            if not keep:
+                return error_response("项目不存在（可能刚被删除）")
+        sid = keep["id"] if keep else uuid.uuid4().hex[:12]
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            return error_response("项目名称不能为空")
+        if len(name) > MAX_NAME:
+            return error_response(f"项目名称不能超过 {MAX_NAME} 个字符")
+        path = str(raw.get("path") or "").strip().strip('"')
+        if not path:
+            return error_response("项目路径不能为空")
+        if not os.path.isdir(path):
+            return error_response(f"路径不存在或不是文件夹: {path}")
+        auto = raw.get("autoRun", keep.get("autoRun", []) if keep else [])
+        if not isinstance(auto, list):
+            return error_response("autoRun 必须是列表")
         try:
-            cleaned = self._clean_input(raw, keep)
+            for rel in auto:
+                self._safe_file({"path": path}, rel)  # 仅校验合法性
         except ValueError as e:
-            return error_response(str(e))
-        scripts = self._cfg_scripts()
-        for i, s in enumerate(scripts):
-            if isinstance(s, dict) and s.get("id") == cleaned["id"]:
-                scripts[i] = cleaned
+            return error_response(f"自动运行清单非法: {e}")
+        for p in self._cfg_projects():
+            if isinstance(p, dict) and p.get("id") != sid and str(p.get("path", "")) == path:
+                return error_response(f"该路径已被项目「{p.get('name')}」添加")
+        cleaned = {
+            "id": sid, "name": name, "path": os.path.realpath(path),
+            "autoRun": [self._norm_rel(r) for r in auto],
+            "createdAt": keep.get("createdAt", time.time()) if keep else time.time(),
+        }
+        projects = self._cfg_projects()
+        for i, p in enumerate(projects):
+            if isinstance(p, dict) and p.get("id") == sid:
+                projects[i] = cleaned
                 break
         else:
-            scripts.append(cleaned)
-        self.config["scripts"] = scripts
+            projects.append(cleaned)
+        self.config["projects"] = projects
         try:
             await self._save()
         except Exception as e:
             return error_response(f"保存失败: {e}")
-        return json_response({"ok": True, "id": cleaned["id"]})
+        return json_response({"ok": True, "id": sid})
 
-    async def web_delete_script(self):
+    async def web_delete_project(self):
         body = await self._body()
         if body is None:
             return error_response("请求体必须是 JSON 对象")
-        sid = body.get("id")
-        if not (isinstance(sid, str) and ID_RE.match(sid)):
-            return error_response("缺少合法的脚本 id")
-        if not self._find(sid):
-            return error_response("脚本不存在")
-        run = self.runs.pop(sid, None)
-        if run:
-            if run.running:
-                await self._kill_run(run)
-            for task in (run.reader, run.waiter):
-                if task and not task.done():
-                    task.cancel()
-        shutil.rmtree(self._run_dir(sid), ignore_errors=True)
-        self.config["scripts"] = [
-            s for s in self._cfg_scripts()
-            if not (isinstance(s, dict) and s.get("id") == sid)]
+        pid = body.get("id")
+        if not (isinstance(pid, str) and ID_RE.match(pid)):
+            return error_response("缺少合法的项目 id")
+        if not self._find_project(pid):
+            return error_response("项目不存在")
+        await self._stop_all(pid)
+        self.consoles.pop(pid, None)
+        self.config["projects"] = [
+            p for p in self._cfg_projects()
+            if not (isinstance(p, dict) and p.get("id") == pid)]
         try:
             await self._save()
         except Exception as e:
             return error_response(f"保存失败: {e}")
+        # 注意：只移除登记，不删除用户文件夹
         return json_response({"ok": True})
+
+    async def web_browse(self):
+        body = await self._body() or {}
+        path = body.get("path")
+        if not isinstance(path, str) or not path:
+            if os.name == "nt":
+                dirs = [{"name": f"{c}:\\", "path": f"{c}:\\"}
+                        for c in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                        if os.path.exists(f"{c}:\\")]
+                return json_response({"ok": True, "at": "", "parent": None, "dirs": dirs})
+            path = "/"
+        path = path.rstrip("\\/") or path
+        if not os.path.isdir(path):
+            return error_response(f"目录不存在: {path}")
+        dirs = []
+        try:
+            for e in os.scandir(path):
+                try:
+                    if e.is_dir(follow_symlinks=False) and not e.name.startswith((".", "$")) \
+                            and e.name.lower() not in SKIP_DIRS:
+                        dirs.append({"name": e.name, "path": e.path})
+                except OSError:
+                    continue
+        except PermissionError:
+            return error_response(f"无权限访问: {path}")
+        dirs.sort(key=lambda d: d["name"].lower())
+        parent = os.path.dirname(path)
+        if parent == path:
+            parent = None
+        return json_response({"ok": True, "at": path, "parent": parent,
+                              "dirs": dirs[:MAX_BROWSE_DIRS]})
+
+    async def _require_project(self, body):
+        pid = body.get("id")
+        proj = self._find_project(pid) if isinstance(pid, str) else None
+        if not proj:
+            raise ValueError("项目不存在")
+        if not os.path.isdir(proj["path"]):
+            raise ValueError(f"项目路径已失效: {proj['path']}")
+        return proj
+
+    async def web_files(self):
+        body = await self._body()
+        if body is None:
+            return error_response("请求体必须是 JSON 对象")
+        try:
+            proj = await self._require_project(body)
+        except ValueError as e:
+            return error_response(str(e))
+        root = os.path.realpath(proj["path"])
+        files = []
+        truncated = False
+
+        def walk(d, depth):
+            nonlocal truncated
+            try:
+                entries = sorted(os.scandir(d), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+            except (PermissionError, OSError):
+                return
+            for e in entries:
+                if len(files) >= MAX_TREE_FILES:
+                    truncated = True
+                    return
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name not in SKIP_DIRS and depth < MAX_TREE_DEPTH:
+                            walk(e.path, depth + 1)
+                    elif e.is_file(follow_symlinks=False) and e.name.endswith(".py"):
+                        files.append(self._norm_rel(os.path.relpath(e.path, root)))
+                except OSError:
+                    continue
+
+        walk(root, 0)
+        return json_response({"ok": True, "files": files, "truncated": truncated})
+
+    async def web_read_file(self):
+        body = await self._body()
+        if body is None:
+            return error_response("请求体必须是 JSON 对象")
+        try:
+            proj = await self._require_project(body)
+            abs_path = self._safe_file(proj, body.get("file"))
+        except ValueError as e:
+            return error_response(str(e))
+        if not os.path.isfile(abs_path):
+            return error_response(f"文件不存在: {body.get('file')}")
+        try:
+            size = os.path.getsize(abs_path)
+            if size > MAX_FILE_BYTES:
+                return error_response(f"文件过大({size}B)，上限 {MAX_FILE_BYTES}B")
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return json_response({"ok": True, "content": content, "mtime": os.path.getmtime(abs_path)})
+        except Exception as e:
+            return error_response(f"读取失败: {e}")
+
+    async def web_write_file(self):
+        body = await self._body()
+        if body is None:
+            return error_response("请求体必须是 JSON 对象")
+        try:
+            proj = await self._require_project(body)
+            abs_path = self._safe_file(proj, body.get("file"))
+        except ValueError as e:
+            return error_response(str(e))
+        content = body.get("content")
+        if not isinstance(content, str):
+            return error_response("content 必须是字符串")
+        if len(content.encode("utf-8", "replace")) > MAX_FILE_BYTES:
+            return error_response(f"内容过大，上限 {MAX_FILE_BYTES}B")
+        try:
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return json_response({"ok": True})
+        except Exception as e:
+            return error_response(f"保存失败: {e}")
 
     async def web_run(self):
         body = await self._body()
         if body is None:
             return error_response("请求体必须是 JSON 对象")
-        sid = body.get("id")
-        script = self._find(sid) if isinstance(sid, str) else None
-        if not script:
-            return error_response("脚本不存在")
         try:
-            await self._start_script(script)
+            proj = await self._require_project(body)
+            run_id = await self._start_file(proj, body.get("file"))
         except ValueError as e:
             return error_response(str(e))
         except Exception as e:
-            logger.exception("[%s] 启动脚本失败", PLUGIN_ID)
-            return error_response(f"启动失败: {e}")
-        return json_response({"ok": True})
+            logger.exception("[%s] 运行失败", PLUGIN_ID)
+            return error_response(f"运行失败: {e}")
+        return json_response({"ok": True, "runId": run_id})
 
     async def web_stop(self):
         body = await self._body()
         if body is None:
             return error_response("请求体必须是 JSON 对象")
-        sid = body.get("id")
-        if not (isinstance(sid, str) and ID_RE.match(sid)):
-            return error_response("缺少合法的脚本 id")
         try:
-            await self.stop_script(sid)
+            proj = await self._require_project(body)
+        except ValueError as e:
+            return error_response(str(e))
+        run_id = body.get("runId")
+        try:
+            if isinstance(run_id, str) and run_id:
+                await self._stop_one(proj["id"], run_id)
+            else:
+                await self._stop_all(proj["id"])
         except ValueError as e:
             return error_response(str(e))
         return json_response({"ok": True})
@@ -436,32 +596,31 @@ class ScriptStation(Star):
         body = await self._body()
         if body is None:
             return error_response("请求体必须是 JSON 对象")
-        sid = body.get("id")
-        run = self.runs.get(sid) if isinstance(sid, str) else None
-        if not run:
-            return json_response({"ok": True, "lines": [], "next": 0, "status": {
-                "state": "stopped", "running": False, "stopping": False,
-                "exitCode": None, "startedAt": 0, "pid": None,
-                "lines": 0, "cursor": 0}})
+        pid = body.get("id")
+        con = self.consoles.get(pid) if isinstance(pid, str) else None
+        empty_status = {"running": 0, "procs": [], "lines": 0, "cursor": 0}
+        if not con:
+            return json_response({"ok": True, "lines": [], "next": 0, "reset": False,
+                                  "status": empty_status})
         try:
             offset = int(body.get("offset", 0))
         except (TypeError, ValueError):
             offset = 0
-        start_seq = run.lines[0]["seq"] if run.lines else run.seq + 1
-        reset = offset < start_seq - 1 and offset != 0
+        start_seq = con.lines[0]["seq"] if con.lines else con.seq + 1
+        reset = offset != 0 and offset < start_seq - 1
         if reset:
             offset = 0
-        lines = [ln for ln in run.lines if ln["seq"] > offset]
-        nxt = lines[-1]["seq"] if lines else max(offset, run.seq)
+        lines = [ln for ln in con.lines if ln["seq"] > offset]
+        nxt = lines[-1]["seq"] if lines else min(offset, con.seq)
         return json_response({"ok": True, "lines": lines, "next": nxt,
-                              "reset": reset, "status": run.status()})
+                              "reset": reset, "status": con.status()})
 
     async def web_clear_log(self):
         body = await self._body()
         if body is None:
             return error_response("请求体必须是 JSON 对象")
-        sid = body.get("id")
-        run = self.runs.get(sid) if isinstance(sid, str) else None
-        if run:
-            run.lines.clear()
+        pid = body.get("id")
+        con = self.consoles.get(pid) if isinstance(pid, str) else None
+        if con:
+            con.lines.clear()
         return json_response({"ok": True})

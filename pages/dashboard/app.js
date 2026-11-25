@@ -1,24 +1,27 @@
-// 脚本挂机面板前端
+// 脚本挂机面板 v2 — 项目文件夹式
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
 await bridge.ready();
 
 // ---------- 状态 ----------
-let scripts = [];            // 服务端全量列表
-let active = "home";         // 'home' 或 script id
-let dirty = false;           // 编辑器未保存标记
-const maxLinesDom = 2000;    // 控制台 DOM 行数上限
-let pollBusy = false;
+let projects = [];
+let active = "home";              // 'home' | project id
+let currentFile = null;           // 项目内相对路径
+const fileStates = {};            // `${pid}|${rel}` -> {code, dirty}
+const fileCounts = {};            // pid -> N（文件树缓存计数）
+const folds = {};                 // `${pid}|${dir}` -> true(收起)
+const logOffsets = {};            // pid -> cursor
+let logsBusy = false;
+const MAX_DOM = 2000;
 
 const $ = (id) => document.getElementById(id);
+const esc = (s) => s; // 用 textContent 渲染，无需转义
 
-// ---------- 工具 ----------
 function toast(msg, kind = "ok") {
   const el = $("toast");
   el.textContent = msg;
-  el.className = kind;
-  el.style.display = "block";
+  el.className = "show " + kind;
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.style.display = "none"; }, 2600);
+  toast._t = setTimeout(() => { el.className = ""; }, 2600);
 }
 
 function askConfirm(msg) {
@@ -31,315 +34,431 @@ function askConfirm(msg) {
   });
 }
 
-function fmtTime(t) {
-  const d = new Date(t * 1000);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
 async function apiPost(path, body) {
   const res = await bridge.apiPost(path, body);
-  if (res && res.ok === false) {
-    toast(res.message || "操作失败", "err");
-    throw new Error(res.message || "api error");
-  }
+  if (res && res.ok === false) { toast(res.message || "操作失败", "err"); throw new Error(res.message); }
   return res;
 }
 
-const byId = (id) => scripts.find((s) => s.id === id);
+function fmtTime(t) {
+  const d = new Date(t * 1000), p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 
-// ---------- 标签页 ----------
+const projById = (id) => projects.find((p) => p.id === id);
+const st = () => fileStates[`${active}|${currentFile}`];
+
+// ---------- 侧栏 ----------
 function renderTabs() {
-  const box = $("tabs");
-  box.innerHTML = "";
-  const mk = (key, label, dotClass) => {
+  const list = $("tabList");
+  list.innerHTML = "";
+  const q = $("searchBox").value.trim().toLowerCase();
+  const mk = (key, avatar, name, sub, running, isHome) => {
     const el = document.createElement("div");
-    el.className = "tab" + (active === key ? " active" : "");
-    if (dotClass) {
+    el.className = "tab" + (isHome ? " home" : "") + (active === key ? " active" : "");
+    const av = document.createElement("div");
+    av.className = "avatar"; av.textContent = avatar;
+    const meta = document.createElement("div"); meta.className = "meta";
+    const t1 = document.createElement("div"); t1.className = "tname"; t1.textContent = name;
+    const t2 = document.createElement("div"); t2.className = "tsub"; t2.textContent = sub;
+    meta.appendChild(t1); meta.appendChild(t2);
+    el.appendChild(av); el.appendChild(meta);
+    if (!isHome) {
       const dot = document.createElement("span");
-      dot.className = "dot " + dotClass;
+      dot.className = "dot" + (running ? " on" : "");
       el.appendChild(dot);
     }
-    const txt = document.createElement("span");
-    txt.textContent = label;
-    el.appendChild(txt);
     el.onclick = () => switchTab(key);
-    box.appendChild(el);
+    list.appendChild(el);
   };
-  mk("home", "首页");
-  for (const s of scripts) {
-    const st = s.status || {};
-    const dot = st.running ? (st.stopping ? "stopping" : "running")
-      : (st.exitCode != null && st.exitCode !== 0 ? "exited" : "");
-    mk(s.id, s.name, dot);
+  mk("home", "🏠", "首页", "添加项目文件夹 / 使用说明", 0, true);
+  for (const p of projects) {
+    if (q && !p.name.toLowerCase().includes(q) && !p.path.toLowerCase().includes(q)) continue;
+    const n = p.status ? p.status.running : 0;
+    const sub = !p.valid ? "⚠ 路径失效" : n ? `运行 ${n} 个脚本` : `${fileCounts[p.id] ?? "-"} 个脚本 · 空闲`;
+    mk(p.id, "📁", p.name, sub, n, false);
   }
 }
 
 function switchTab(key) {
   if (active === key) return;
-  if (active !== "home" && dirty) {
-    // 有未保存修改时切换标签：保留在 state 里（服务端为准，提示用户）
-    toast("有未保存的代码修改，切回该标签前请先保存（切换将丢失编辑框内容）", "err");
-  }
   active = key;
   const isHome = key === "home";
-  $("view-home").classList.toggle("hidden", !isHome);
-  $("view-script").classList.toggle("hidden", isHome);
+  $("homeView").style.display = isHome ? "" : "none";
+  $("projView").style.display = isHome ? "none" : "";
   if (!isHome) {
-    const s = byId(key);
-    $("scName").value = s ? s.name : "";
-    $("scCode").value = s ? s.code : "";
-    $("scAuto").checked = !!(s && s.autoStart);
-    dirty = false;
+    currentFile = null;
     $("console").innerHTML = "";
-    renderScriptStatus();
-    pollLogs(true);
+    logOffsets[key] = 0;
+    renderProjectHead();
+    renderEditor();
+    loadFiles(key);
+    pollLogs(key, true);
   }
   renderTabs();
-  renderLibrary();
+  renderProjTable();
 }
 
-// ---------- 首页脚本库 ----------
-function renderLibrary() {
-  const tbody = $("libBody");
-  tbody.innerHTML = "";
-  $("libEmpty").classList.toggle("hidden", scripts.length > 0);
-  for (const s of scripts) {
-    const st = s.status || {};
+// ---------- 首页 ----------
+function renderProjTable() {
+  const tb = $("projTable");
+  tb.innerHTML = "";
+  $("projEmpty").style.display = projects.length ? "none" : "";
+  for (const p of projects) {
     const tr = document.createElement("tr");
-
-    const tdName = document.createElement("td");
-    tdName.textContent = s.name;
-    tr.appendChild(tdName);
-
-    const tdState = document.createElement("td");
+    const td = (html) => { const c = document.createElement("td"); c.textContent = html; tr.appendChild(c); return c; };
+    td(p.name);
+    td(p.path);
+    const tdS = td("");
     const pill = document.createElement("span");
-    pill.className = "pill " + (st.running ? "running"
-      : st.exitCode != null ? (st.exitCode === 0 ? "" : "exited") : "");
-    pill.textContent = st.running ? "运行中"
-      : st.exitCode != null ? `已退出(${st.exitCode})` : "已停止";
-    tdState.appendChild(pill);
-    tr.appendChild(tdState);
-
-    const tdAuto = document.createElement("td");
-    const chk = document.createElement("input");
-    chk.type = "checkbox";
-    chk.checked = !!s.autoStart;
-    chk.onchange = async () => {
+    const n = p.status ? p.status.running : 0;
+    pill.className = "pill" + (n ? " on" : "") + (p.valid ? "" : " bad");
+    pill.textContent = !p.valid ? "路径失效" : n ? `运行 ${n}` : "空闲";
+    tdS.appendChild(pill);
+    const tdO = document.createElement("td");
+    const mkB = (t, cls, fn) => { const b = document.createElement("button"); b.className = "btn small " + cls; b.textContent = t; b.onclick = fn; tdO.appendChild(b); };
+    mkB("打开", "secondary", () => switchTab(p.id));
+    mkB("删除", "danger", async () => {
+      if (!await askConfirm(`删除项目「${p.name}」登记？运行中的脚本会被停止，你的文件夹和文件不会被删除。`)) return;
       try {
-        await apiPost("scripts/save", { script: { id: s.id, name: s.name, code: s.code, autoStart: chk.checked } });
-        toast(chk.checked ? "已开启自动启动" : "已关闭自动启动");
-        await refresh();
-      } catch { chk.checked = s.autoStart; }
-    };
-    tdAuto.appendChild(chk);
-    tr.appendChild(tdAuto);
-
-    const tdOps = document.createElement("td");
-    const ops = document.createElement("div");
-    ops.className = "ops";
-    const mkBtn = (text, cls, fn) => {
-      const b = document.createElement("button");
-      b.textContent = text;
-      b.className = cls;
-      b.onclick = fn;
-      ops.appendChild(b);
-    };
-    mkBtn("打开", "", () => switchTab(s.id));
-    mkBtn(st.running ? "停止" : "启动", st.running ? "stop" : "run", async () => {
-      try {
-        await apiPost(st.running ? "stop" : "run", { id: s.id });
-        toast(st.running ? "已发送停止指令" : "已启动");
+        await apiPost("projects/delete", { id: p.id });
+        if (active === p.id) switchTab("home");
+        toast("已删除（文件保留）");
         await refresh();
       } catch {}
     });
-    mkBtn("删除", "danger", async () => {
-      if (!await askConfirm(`确定删除脚本「${s.name}」？运行中的进程会被停止，且不可恢复。`)) return;
-      try {
-        await apiPost("scripts/delete", { id: s.id });
-        if (active === s.id) switchTab("home");
-        toast("已删除");
-        await refresh();
-      } catch {}
-    });
-    tdOps.appendChild(ops);
-    tr.appendChild(tdOps);
-
-    tbody.appendChild(tr);
+    tr.appendChild(tdO);
+    tb.appendChild(tr);
   }
 }
 
-// ---------- 脚本详情 ----------
-function renderScriptStatus() {
-  const s = byId(active);
-  if (!s) return;
-  const st = s.status || {};
-  const pill = $("scState");
-  const state = st.running ? "running" : (st.exitCode != null ? (st.exitCode === 0 ? "stopped" : "exited") : "stopped");
-  pill.className = "pill " + (state === "running" ? "running" : state === "exited" ? "exited" : "");
-  pill.textContent = st.running ? `运行中 (pid ${st.pid || "-"})`
-    : st.exitCode != null ? `已退出 (code ${st.exitCode})` : "已停止";
-  $("btnRun").disabled = !!st.running;
-  $("btnStop").disabled = !st.running;
-  $("scHint").textContent = dirty ? "● 有未保存修改" : "";
-}
+$("btnPlus").onclick = () => { switchTab("home"); $("projName").focus(); };
+$("searchBox").addEventListener("input", renderTabs);
 
-function appendConsole(lines) {
-  const box = $("console");
-  const follow = $("conFollow").checked;
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-  for (const ln of lines) {
-    const span = document.createElement("span");
-    span.className = "line" + (ln.text.startsWith("[面板]") ? " sys" : "");
-    const ts = document.createElement("span");
-    ts.className = "ts";
-    ts.textContent = fmtTime(ln.t);
-    span.appendChild(ts);
-    span.appendChild(document.createTextNode(ln.text));
-    box.appendChild(span);
-  }
-  while (box.childElementCount > maxLinesDom) box.removeChild(box.firstChild);
-  if (follow && atBottom) box.scrollTop = box.scrollHeight;
-}
-
-let logsOffset = 0;
-async function pollLogs(reset = false) {
-  if (active === "home" || pollBusy) return;
-  pollBusy = true;
+$("btnAddProj").onclick = async () => {
+  const name = $("projName").value.trim();
+  const path = $("projPath").value.trim();
+  if (!name) return toast("请填写项目名", "err");
+  if (!path) return toast("请填写或浏览选择文件夹路径", "err");
   try {
-    if (reset) logsOffset = 0;
-    const res = await apiPost("logs", { id: active, offset: logsOffset });
-    if (active === "home") return; // 轮询期间切走了
-    if (res.reset) $("console").innerHTML = "";
-    if (res.lines && res.lines.length) appendConsole(res.lines);
-    logsOffset = res.next;
-    if (res.status) {
-      const s = byId(active);
-      if (s) { s.status = res.status; renderScriptStatus(); renderTabs(); }
+    const r = await apiPost("projects/save", { project: { name, path } });
+    $("projName").value = ""; $("projPath").value = "";
+    toast("项目已创建");
+    await refresh();
+    if (r.id) switchTab(r.id);
+  } catch {}
+};
+
+// ---------- 目录浏览 ----------
+let browseAt = null, browseParent = undefined;
+async function openBrowse() {
+  $("browseMask").style.display = "flex";
+  await browseTo(null);
+}
+async function browseTo(path) {
+  try {
+    const r = await apiPost("browse", { path });
+    browseAt = r.at; browseParent = r.parent;
+    $("browsePath").textContent = r.at || "（选择盘符）";
+    $("brUp").disabled = !r.parent;
+    const box = $("browseList");
+    box.innerHTML = "";
+    if (!r.dirs.length) {
+      const d = document.createElement("div"); d.className = "bd"; d.textContent = "（没有子文件夹）"; d.style.cursor = "default";
+      box.appendChild(d);
     }
-  } catch { /* 网络抖动忽略，下轮重试 */ }
-  finally { pollBusy = false; }
+    for (const d of r.dirs) {
+      const row = document.createElement("div");
+      row.className = "bd";
+      row.textContent = "📁 " + d.name;
+      row.onclick = () => browseTo(d.path);
+      box.appendChild(row);
+    }
+  } catch { $("browseMask").style.display = "none"; }
+}
+$("btnBrowse").onclick = openBrowse;
+$("brUp").onclick = () => { if (browseParent) browseTo(browseParent); };
+$("brCancel").onclick = () => { $("browseMask").style.display = "none"; };
+$("brPick").onclick = () => {
+  if (!browseAt) return toast("请先进入一个文件夹", "err");
+  $("projPath").value = browseAt;
+  if (!$("projName").value.trim()) $("projName").value = browseAt.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+  $("browseMask").style.display = "none";
+};
+
+// ---------- 项目视图 ----------
+function renderProjectHead() {
+  const p = projById(active);
+  if (!p) return;
+  $("pvTitle").textContent = p.name;
+  $("pvPath").textContent = p.path;
+  $("pvPath").title = p.path;
+  const n = p.status ? p.status.running : 0;
+  const pill = $("pvState");
+  pill.className = "pill" + (n ? " on" : "") + (p.valid ? "" : " bad");
+  pill.textContent = !p.valid ? "⚠ 路径失效" : n ? `运行 ${n} 个进程` : "空闲";
+  $("btnStopAll").disabled = !n;
+  const meta = $("conMeta");
+  meta.textContent = p.status && p.status.procs.length
+    ? "运行中: " + p.status.procs.map((x) => `${x.file}(pid ${x.pid})`).join("  ")
+    : "无运行中的脚本";
 }
 
-// ---------- 按钮 ----------
-$("btnAdd").onclick = async () => {
-  const name = $("newName").value.trim();
-  const code = $("newCode").value;
-  if (!name) return toast("请填写脚本名称", "err");
-  if (!code.trim()) return toast("请填写脚本代码", "err");
+async function loadFiles(pid) {
   try {
-    const res = await apiPost("scripts/save", {
-      script: { name, code, autoStart: $("newAuto").checked },
-    });
-    $("newName").value = "";
-    $("newCode").value = "";
-    $("newAuto").checked = false;
-    toast("已添加脚本");
+    const r = await apiPost("files", { id: pid });
+    if (pid !== active) return;
+    fileCounts[pid] = r.files.length;
+    renderTree(pid, r.files, r.truncated);
+    renderTabs();
+  } catch (e) {
+    if (pid === active) $("fileTree").innerHTML = "";
+    if (pid === active) { const d = document.createElement("div"); d.className = "empty"; d.textContent = "无法读取文件树"; $("fileTree").appendChild(d); }
+  }
+}
+
+function renderTree(pid, files, truncated) {
+  const box = $("fileTree");
+  box.innerHTML = "";
+  if (!files.length) {
+    const d = document.createElement("div"); d.className = "empty"; d.textContent = "文件夹内没有 .py 文件";
+    box.appendChild(d); return;
+  }
+  // 构建树
+  const root = { dirs: {}, files: [] };
+  for (const f of files) {
+    const parts = f.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) node = node.dirs[parts[i]] ??= { dirs: {}, files: [] };
+    node.files.push({ name: parts[parts.length - 1], rel: f });
+  }
+  const walk = (node, prefix, depth) => {
+    for (const [name, child] of Object.entries(node.dirs)) {
+      const dirKey = `${pid}|${prefix}${name}`;
+      const folded = folds[dirKey];
+      const row = document.createElement("div");
+      row.className = "node folder";
+      row.style.paddingLeft = `${6 + depth * 14}px`;
+      row.textContent = `${folded ? "▸" : "▾"} 📁 ${name}`;
+      row.onclick = () => { folds[dirKey] = !folded; renderTree(pid, files, truncated); };
+      box.appendChild(row);
+      if (!folded) walk(child, `${prefix}${name}/`, depth + 1);
+    }
+    for (const f of node.files) {
+      const row = document.createElement("div");
+      row.className = "node" + (currentFile === f.rel ? " sel" : "");
+      row.style.paddingLeft = `${20 + depth * 14}px`;
+      row.textContent = "🐍 " + f.name;
+      row.title = f.rel;
+      row.onclick = () => selectFile(f.rel);
+      box.appendChild(row);
+    }
+  };
+  walk(root, "", 0);
+  if (truncated) {
+    const d = document.createElement("div"); d.className = "hint"; d.textContent = `文件过多，仅显示前 ${files.length} 个`;
+    box.appendChild(d);
+  }
+}
+
+async function selectFile(rel) {
+  const key = `${active}|${rel}`;
+  if (!fileStates[key]) {
+    try {
+      const r = await apiPost("read_file", { id: active, file: rel });
+      fileStates[key] = { code: r.content, dirty: false };
+    } catch { return; }
+  }
+  currentFile = rel;
+  renderEditor();
+  // 重绘选中态
+  const p = projById(active);
+  if (p) loadFiles(active);
+}
+
+function renderEditor() {
+  const s = st();
+  $("edFile").textContent = currentFile || "未选择文件";
+  $("edCode").value = s ? s.code : "";
+  $("edCode").disabled = !s;
+  $("edDirty").textContent = s && s.dirty ? "● 未保存" : "";
+  $("btnSaveFile").disabled = !s || !s.dirty;
+  const p = projById(active);
+  const running = !!(p && p.status && p.status.procs.some((x) => x.file === currentFile));
+  $("btnRunFile").disabled = !currentFile || running || !p || !p.valid;
+  $("btnStopFile").disabled = !running;
+  $("btnAutoRun").disabled = !currentFile || !p;
+  if (p && currentFile) {
+    $("btnAutoRun").textContent = p.autoRun.includes(currentFile) ? "取消自动运行" : "设为自动运行";
+    $("btnAutoRun").classList.toggle("secondary", true);
+  }
+}
+
+$("edCode").addEventListener("input", () => {
+  const s = st();
+  if (s) { s.code = $("edCode").value; s.dirty = true; renderEditor(); }
+});
+$("edCode").addEventListener("keydown", (e) => {
+  if (e.key === "Tab" && st()) {
+    e.preventDefault();
+    const el = e.target, pos = el.selectionStart;
+    el.setRangeText("    ", pos, el.selectionEnd, "end");
+    const s = st(); s.code = el.value; s.dirty = true; renderEditor();
+  }
+  if (e.key === "s" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("btnSaveFile").click(); }
+});
+
+async function saveCurrent() {
+  const s = st();
+  if (!s || !s.dirty) return true;
+  try {
+    await apiPost("write_file", { id: active, file: currentFile, content: s.code });
+    s.dirty = false;
+    renderEditor();
+    return true;
+  } catch { return false; }
+}
+
+$("btnSaveFile").onclick = async () => { if (await saveCurrent()) toast("已保存"); };
+
+$("btnRunFile").onclick = async () => {
+  if (!await saveCurrent()) return;
+  try {
+    await apiPost("run", { id: active, file: currentFile });
+    toast("已启动 " + currentFile);
     await refresh();
-    if (res && res.id) switchTab(res.id);
+    renderEditor();
   } catch {}
 };
 
-$("btnSave").onclick = async () => {
-  const s = byId(active);
-  if (!s) return;
+$("btnStopFile").onclick = async () => {
+  const p = projById(active);
+  const proc = p && p.status.procs.find((x) => x.file === currentFile);
+  if (!proc) return;
   try {
-    await apiPost("scripts/save", {
-      script: { id: s.id, name: $("scName").value.trim(), code: $("scCode").value, autoStart: $("scAuto").checked },
-    });
-    dirty = false;
-    toast("已保存");
+    await apiPost("stop", { id: active, runId: proc.runId });
+    toast("已停止");
     await refresh();
+    renderEditor();
   } catch {}
 };
 
-$("btnRun").onclick = async () => {
-  const s = byId(active);
-  if (!s) return;
-  // 运行前自动保存当前编辑器内容，避免跑旧代码
-  try {
-    await apiPost("scripts/save", {
-      script: { id: s.id, name: $("scName").value.trim(), code: $("scCode").value, autoStart: $("scAuto").checked },
-    });
-    dirty = false;
-    await apiPost("run", { id: s.id });
-    $("console").innerHTML = "";
-    logsOffset = 0;
-    toast("已启动");
-    await refresh();
-  } catch {}
-};
-
-$("btnStop").onclick = async () => {
+$("btnStopAll").onclick = async () => {
   try {
     await apiPost("stop", { id: active });
-    toast("已发送停止指令");
+    toast("已停止全部");
     await refresh();
   } catch {}
 };
 
-$("btnDel").onclick = async () => {
-  const s = byId(active);
-  if (!s) return;
-  if (!await askConfirm(`确定删除脚本「${s.name}」？运行中的进程会被停止，且不可恢复。`)) return;
+$("btnAutoRun").onclick = async () => {
+  const p = projById(active);
+  if (!p || !currentFile) return;
+  const list = p.autoRun.includes(currentFile)
+    ? p.autoRun.filter((x) => x !== currentFile)
+    : [...p.autoRun, currentFile];
   try {
-    await apiPost("scripts/delete", { id: s.id });
-    toast("已删除");
-    active = "__gone__"; // 强制 switchTab 到 home 生效
+    await apiPost("projects/save", { project: { id: p.id, name: p.name, path: p.path, autoRun: list } });
+    toast(list.includes(currentFile) ? "已设为自动运行（插件加载时自动启动）" : "已取消自动运行");
+    await refresh();
+    renderEditor();
+  } catch {}
+};
+
+$("btnRename").onclick = () => {
+  const h = $("pvTitle");
+  const p = projById(active);
+  if (!p || h.tagName === "INPUT") return;
+  const inp = document.createElement("input");
+  inp.value = p.name; inp.style.width = "220px";
+  h.replaceWith(inp); inp.focus(); inp.select();
+  const finish = async (ok) => {
+    const v = inp.value.trim();
+    inp.replaceWith(h);
+    if (ok && v && v !== p.name) {
+      try {
+        await apiPost("projects/save", { project: { id: p.id, name: v, path: p.path, autoRun: p.autoRun } });
+        toast("已改名"); await refresh();
+      } catch {}
+    }
+  };
+  inp.onblur = () => finish(true);
+  inp.onkeydown = (e) => { if (e.key === "Enter") inp.blur(); if (e.key === "Escape") { inp.value = p.name; inp.blur(); } };
+};
+
+$("btnDelProj").onclick = async () => {
+  const p = projById(active);
+  if (!p) return;
+  if (!await askConfirm(`删除项目「${p.name}」登记？运行中的脚本会被停止，你的文件夹和文件不会被删除。`)) return;
+  try {
+    await apiPost("projects/delete", { id: p.id });
+    toast("已删除（文件保留）");
     switchTab("home");
     await refresh();
   } catch {}
 };
 
-$("btnClearLog").onclick = async () => {
+$("btnRefreshFiles").onclick = () => { if (active !== "home") loadFiles(active); };
+$("btnClear").onclick = async () => {
   try {
     await apiPost("clear_log", { id: active });
     $("console").innerHTML = "";
-    logsOffset = 0;
+    logOffsets[active] = 0;
   } catch {}
 };
 
-$("scCode").addEventListener("input", () => { dirty = true; renderScriptStatus(); });
-$("scName").addEventListener("input", () => { dirty = true; renderScriptStatus(); });
-$("scAuto").addEventListener("change", () => { dirty = true; renderScriptStatus(); });
-// Tab 键在代码框内插入缩进
-$("scCode").addEventListener("keydown", (e) => {
-  if (e.key === "Tab") {
-    e.preventDefault();
-    const el = e.target;
-    const st = el.selectionStart;
-    el.setRangeText("    ", st, el.selectionEnd, "end");
-    dirty = true;
-  }
-});
-new ResizeObserver(() => {
-  // 面板宽度变化时保持控制台贴底
+// ---------- 控制台 ----------
+function appendConsole(pid, lines) {
   const box = $("console");
-  if ($("conFollow").checked && box.scrollHeight - box.scrollTop - box.clientHeight < 80) {
-    box.scrollTop = box.scrollHeight;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  for (const ln of lines) {
+    const span = document.createElement("span");
+    span.className = "line" + (ln.text.startsWith("[面板]") ? " sys" : "");
+    const ts = document.createElement("span"); ts.className = "ts"; ts.textContent = fmtTime(ln.t);
+    const tg = document.createElement("span"); tg.className = "tag"; tg.textContent = `[${ln.tag}]`;
+    span.appendChild(ts); span.appendChild(tg);
+    span.appendChild(document.createTextNode(" " + ln.text));
+    box.appendChild(span);
   }
-}).observe($("console"));
+  while (box.childElementCount > MAX_DOM) box.removeChild(box.firstChild);
+  if ($("conFollow").checked && atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function pollLogs(pid, reset) {
+  if (active !== pid || logsBusy) return;
+  logsBusy = true;
+  try {
+    if (reset) logOffsets[pid] = 0;
+    const r = await apiPost("logs", { id: pid, offset: logOffsets[pid] || 0 });
+    if (active !== pid) return;
+    if (r.reset) $("console").innerHTML = "";
+    if (r.lines.length) appendConsole(pid, r.lines);
+    logOffsets[pid] = r.next;
+    const p = projById(pid);
+    if (p && r.status) { p.status = r.status; renderProjectHead(); renderEditor(); }
+  } catch {} finally { logsBusy = false; }
+}
 
 // ---------- 轮询 ----------
 async function refresh() {
   try {
-    const res = await bridge.apiGet("scripts");
-    if (res && res.ok) {
-      scripts = res.scripts || [];
-      renderTabs();
-      if (active === "home") renderLibrary();
-      else {
-        renderScriptStatus();
-        const s = byId(active);
-        if (!s) { active = "__gone__"; switchTab("home"); }
-      }
+    const res = await bridge.apiGet("projects");
+    if (!res || !res.ok) return;
+    projects = res.projects || [];
+    renderTabs();
+    if (active === "home") renderProjTable();
+    else {
+      const p = projById(active);
+      if (!p) { active = "home"; switchTab("home"); return; }
+      renderProjectHead();
+      renderEditor();
     }
   } catch {}
 }
 
 setInterval(refresh, 2500);
-setInterval(() => pollLogs(false), 1200);
+setInterval(() => { if (active !== "home") pollLogs(active, false); }, 1200);
 
 await refresh();
 renderTabs();
-renderLibrary();
+renderProjTable();

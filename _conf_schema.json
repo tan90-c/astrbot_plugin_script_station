@@ -1,8 +1,8 @@
 {
-  "scripts": {
-    "description": "脚本库（由面板维护，请勿手动修改）",
+  "projects": {
+    "description": "项目文件夹登记表（由面板维护，请勿手动修改）",
     "type": "list",
     "default": [],
-    "hint": "每项为 {id,name,code,autoStart,createdAt,updatedAt}。不在本 schema 中的键会在插件重载时被丢弃，因此脚本必须存在这里。"
+    "hint": "每项为 {id,name,path,autoRun:[项目内相对.py路径],createdAt}。不在 schema 中的键会在插件重载时被丢弃。v1 的 scripts 键已废弃：脚本以项目目录内真实文件为准。"
   }
 }
