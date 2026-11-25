@@ -64,12 +64,14 @@ except ImportError:  # 部分版本无 astrbot.api.web：Quart 回退
     request = _ReqProxy()
 
 PLUGIN_ID = "astrbot_plugin_script_station"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 MAX_NAME = 64
-MAX_FILE_BYTES = 200_000   # 单脚本读/写上限
+MAX_FILE_BYTES = 200_000   # 单文件文本读写上限
+MAX_PREVIEW_BYTES = 5_000_000  # 图片预览上限
+IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"}
 MAX_LINES = 3000           # 每项目控制台保留行数
-MAX_TREE_FILES = 800       # 文件树最多返回文件数
+MAX_TREE_FILES = 2000      # 文件树最多返回文件数
 MAX_TREE_DEPTH = 6
 MAX_BROWSE_DIRS = 400
 ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
@@ -141,8 +143,10 @@ class ScriptStation(Star):
             a(f"/{PLUGIN_ID}/browse", self.web_browse, ["POST"], "浏览本机目录")
             a(f"/{PLUGIN_ID}/mkdir", self.web_mkdir, ["POST"], "新建子文件夹")
             a(f"/{PLUGIN_ID}/files", self.web_files, ["POST"], "项目内 .py 文件树")
-            a(f"/{PLUGIN_ID}/read_file", self.web_read_file, ["POST"], "读取脚本")
-            a(f"/{PLUGIN_ID}/write_file", self.web_write_file, ["POST"], "保存脚本")
+            a(f"/{PLUGIN_ID}/read_file", self.web_read_file, ["POST"], "读取文件")
+            a(f"/{PLUGIN_ID}/write_file", self.web_write_file, ["POST"], "保存文件")
+            a(f"/{PLUGIN_ID}/delete_file", self.web_delete_file, ["POST"], "删除文件")
+            a(f"/{PLUGIN_ID}/preview", self.web_preview, ["POST"], "图片预览(base64)")
             a(f"/{PLUGIN_ID}/run", self.web_run, ["POST"], "运行脚本文件")
             a(f"/{PLUGIN_ID}/stop", self.web_stop, ["POST"], "停止一个/全部进程")
             a(f"/{PLUGIN_ID}/logs", self.web_logs, ["POST"], "增量拉取控制台")
@@ -198,18 +202,17 @@ class ScriptStation(Star):
         return str(rel or "").replace("\\", "/").strip("/")
 
     def _safe_file(self, project: dict, rel: str) -> str:
-        """把相对路径解析为项目内绝对路径；越界/非 .py 抛 ValueError。"""
+        """把相对路径解析为项目内绝对路径；越界抛 ValueError（允许任意文件）。"""
         rel = self._norm_rel(rel)
         if not rel or ".." in rel.split("/"):
             raise ValueError("非法文件路径")
-        if not rel.endswith(".py"):
-            raise ValueError("只能操作 .py 脚本文件")
         root = os.path.realpath(project["path"])
         abs_path = os.path.realpath(os.path.join(root, rel))
         try:
-            if os.path.commonpath([root, abs_path]) != root:
-                raise ValueError("文件路径越出项目目录")
+            inside = os.path.commonpath([root, abs_path]) == root
         except ValueError:
+            inside = False
+        if not inside:
             raise ValueError("文件路径越出项目目录")
         return abs_path
 
@@ -243,6 +246,8 @@ class ScriptStation(Star):
 
     async def _start_file(self, project: dict, rel: str) -> str:
         rel = self._norm_rel(rel)
+        if not rel.endswith(".py"):
+            raise ValueError("只能运行 .py 脚本")
         abs_path = self._safe_file(project, rel)
         if not os.path.isfile(abs_path):
             raise ValueError(f"文件不存在: {rel}")
@@ -428,7 +433,10 @@ class ScriptStation(Star):
             return error_response("autoRun 必须是列表")
         try:
             for rel in auto:
-                self._safe_file({"path": path}, rel)  # 仅校验合法性
+                if self._norm_rel(rel).endswith(".py"):
+                    self._safe_file({"path": path}, rel)  # 仅校验合法性
+                else:
+                    raise ValueError(f"自动运行只能包含 .py 文件: {rel}")
         except ValueError as e:
             return error_response(f"自动运行清单非法: {e}")
         for p in self._cfg_projects():
@@ -569,7 +577,7 @@ class ScriptStation(Star):
                     if e.is_dir(follow_symlinks=False):
                         if e.name not in SKIP_DIRS and depth < MAX_TREE_DEPTH:
                             walk(e.path, depth + 1)
-                    elif e.is_file(follow_symlinks=False) and e.name.endswith(".py"):
+                    elif e.is_file(follow_symlinks=False):
                         files.append(self._norm_rel(os.path.relpath(e.path, root)))
                 except OSError:
                     continue
@@ -591,10 +599,15 @@ class ScriptStation(Star):
         try:
             size = os.path.getsize(abs_path)
             if size > MAX_FILE_BYTES:
-                return error_response(f"文件过大({size}B)，上限 {MAX_FILE_BYTES}B")
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            return json_response({"ok": True, "content": content, "mtime": os.path.getmtime(abs_path)})
+                return error_response(f"文件过大({size}B)，文本读写上限 {MAX_FILE_BYTES}B")
+            with open(abs_path, "rb") as f:
+                raw = f.read()
+            if b"\x00" in raw[:8192]:
+                return json_response({"ok": True, "binary": True, "size": size,
+                                      "mtime": os.path.getmtime(abs_path)})
+            return json_response({"ok": True, "binary": False, "size": size,
+                                  "content": raw.decode("utf-8", "replace"),
+                                  "mtime": os.path.getmtime(abs_path)})
         except Exception as e:
             return error_response(f"读取失败: {e}")
 
@@ -618,6 +631,51 @@ class ScriptStation(Star):
             return json_response({"ok": True})
         except Exception as e:
             return error_response(f"保存失败: {e}")
+
+    async def web_delete_file(self):
+        body = await self._body()
+        if body is None:
+            return error_response("请求体必须是 JSON 对象")
+        try:
+            proj = await self._require_project(body)
+            abs_path = self._safe_file(proj, body.get("file"))
+        except ValueError as e:
+            return error_response(str(e))
+        if not os.path.isfile(abs_path):
+            return error_response("文件不存在或不是普通文件")
+        try:
+            os.remove(abs_path)
+            return json_response({"ok": True})
+        except Exception as e:
+            return error_response(f"删除失败: {e}")
+
+    async def web_preview(self):
+        import base64
+        import mimetypes
+        body = await self._body()
+        if body is None:
+            return error_response("请求体必须是 JSON 对象")
+        try:
+            proj = await self._require_project(body)
+            abs_path = self._safe_file(proj, body.get("file"))
+        except ValueError as e:
+            return error_response(str(e))
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in IMG_EXT:
+            return error_response("仅支持预览图片: " + "/".join(sorted(e[1:] for e in IMG_EXT)))
+        if not os.path.isfile(abs_path):
+            return error_response("文件不存在")
+        size = os.path.getsize(abs_path)
+        if size > MAX_PREVIEW_BYTES:
+            return error_response(f"图片过大({size}B)，预览上限 {MAX_PREVIEW_BYTES}B")
+        try:
+            with open(abs_path, "rb") as f:
+                raw = f.read()
+        except Exception as e:
+            return error_response(f"读取失败: {e}")
+        mime = mimetypes.guess_type(abs_path)[0] or "image/png"
+        url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        return json_response({"ok": True, "dataUrl": url, "size": size})
 
     async def web_run(self):
         body = await self._body()

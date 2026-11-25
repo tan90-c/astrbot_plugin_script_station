@@ -48,6 +48,17 @@ function fmtTime(t) {
 
 const projById = (id) => projects.find((p) => p.id === id);
 const st = () => fileStates[`${active}|${currentFile}`];
+const IMG_EXT = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"];
+const extOf = (rel) => (rel.split(".").pop() || "").toLowerCase();
+const iconOf = (rel) => {
+  const e = extOf(rel);
+  if (e === "py") return "🐍";
+  if (IMG_EXT.includes(e)) return "🖼";
+  if (["json", "yaml", "yml", "toml", "ini", "conf", "env", "lock"].includes(e)) return "⚙️";
+  if (["md", "txt", "log", "csv", "html", "htm", "js", "ts", "css", "xml", "bat", "sh", "ps1"].includes(e)) return "📄";
+  return "📦";
+};
+const fmtSize = (n) => n >= 1024 * 1024 ? (n / 1048576).toFixed(2) + " MB" : (n / 1024).toFixed(1) + " KB";
 
 // ---------- 侧栏 ----------
 function renderTabs() {
@@ -264,7 +275,7 @@ function renderTree(pid, files, truncated) {
       const row = document.createElement("div");
       row.className = "node" + (currentFile === f.rel ? " sel" : "");
       row.style.paddingLeft = `${20 + depth * 14}px`;
-      row.textContent = "🐍 " + f.name;
+      row.textContent = iconOf(f.rel) + " " + f.name;
       row.title = f.rel;
       row.onclick = () => selectFile(f.rel);
       box.appendChild(row);
@@ -282,29 +293,51 @@ async function selectFile(rel) {
   if (!fileStates[key]) {
     try {
       const r = await apiPost("read_file", { id: active, file: rel });
-      fileStates[key] = { code: r.content, dirty: false };
+      if (r.binary) {
+        if (IMG_EXT.includes(extOf(rel))) {
+          try {
+            const pv = await apiPost("preview", { id: active, file: rel });
+            fileStates[key] = { type: "image", url: pv.dataUrl, size: pv.size };
+          } catch { fileStates[key] = { type: "binary", size: r.size }; }
+        } else {
+          fileStates[key] = { type: "binary", size: r.size };
+        }
+      } else {
+        fileStates[key] = { type: "text", code: r.content, dirty: false, size: r.size };
+      }
     } catch { return; }
   }
   currentFile = rel;
   renderEditor();
-  // 重绘选中态
-  const p = projById(active);
-  if (p) loadFiles(active);
+  loadFiles(active);   // 重绘选中态
 }
 
 function renderEditor() {
   const s = st();
   $("edFile").textContent = currentFile || "未选择文件";
-  $("edCode").value = s ? s.code : "";
-  $("edCode").disabled = !s;
-  $("edDirty").textContent = s && s.dirty ? "● 未保存" : "";
-  $("btnSaveFile").disabled = !s || !s.dirty;
+  const isText = !!s && s.type === "text";
+  const isImg = !!s && s.type === "image";
+  const isBin = !!s && s.type === "binary";
+  const isPy = !!currentFile && extOf(currentFile) === "py";
+  $("edCode").style.display = s && !isText ? "none" : "";
+  $("edCode").value = isText ? s.code : "";
+  $("edCode").disabled = !isText;
+  $("previewBox").style.display = isImg ? "" : "none";
+  if (isImg) {
+    $("previewImg").src = s.url;
+    $("previewInfo").textContent = `${currentFile} · ${fmtSize(s.size)}（图片预览，不支持编辑）`;
+  }
+  $("binInfo").style.display = isBin ? "" : "none";
+  if (isBin) $("binInfo").textContent = `二进制文件（${fmtSize(s.size)}），不支持编辑/预览/运行`;
+  $("edDirty").textContent = isText && s.dirty ? "● 未保存" : "";
+  $("btnSaveFile").disabled = !isText || !s.dirty;
+  $("btnDelFile").disabled = !currentFile;
   const p = projById(active);
   const running = !!(p && p.status && p.status.procs.some((x) => x.file === currentFile));
-  $("btnRunFile").disabled = !currentFile || running || !p || !p.valid;
+  $("btnRunFile").disabled = !isPy || running || !p || !p.valid;
   $("btnStopFile").disabled = !running;
-  $("btnAutoRun").disabled = !currentFile || !p;
-  if (p && currentFile) {
+  $("btnAutoRun").disabled = !isPy || !p;
+  if (p && currentFile && isPy) {
     $("btnAutoRun").textContent = p.autoRun.includes(currentFile) ? "取消自动运行" : "设为自动运行";
     $("btnAutoRun").classList.toggle("secondary", true);
   }
@@ -326,7 +359,7 @@ $("edCode").addEventListener("keydown", (e) => {
 
 async function saveCurrent() {
   const s = st();
-  if (!s || !s.dirty) return true;
+  if (!s || s.type !== "text" || !s.dirty) return true;
   try {
     await apiPost("write_file", { id: active, file: currentFile, content: s.code });
     s.dirty = false;
@@ -336,6 +369,21 @@ async function saveCurrent() {
 }
 
 $("btnSaveFile").onclick = async () => { if (await saveCurrent()) toast("已保存"); };
+
+$("btnDelFile").onclick = async () => {
+  if (!currentFile) return;
+  if (!await askConfirm(`删除文件「${currentFile}」？此操作会真实删除磁盘文件，不可恢复！`)) return;
+  try {
+    await apiPost("delete_file", { id: active, file: currentFile });
+    delete fileStates[`${active}|${currentFile}`];
+    const p = projById(active);
+    if (p) p.autoRun = p.autoRun.filter((x) => x !== currentFile);
+    toast("已删除文件");
+    currentFile = null;
+    renderEditor();
+    loadFiles(active);
+  } catch {}
+};
 
 $("btnRunFile").onclick = async () => {
   if (!await saveCurrent()) return;

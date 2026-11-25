@@ -127,7 +127,7 @@ textarea.code{width:100%;min-height:260px;font-family:Consolas,Menlo,monospace;f
       </div>
       <div class="card">
         <h2>使用说明</h2>
-        <div class="hint">1. 每个项目一个标签页，一个共享控制台（所有运行脚本的输出汇入，带文件名前缀）<br>2. 支持 app.run(host=..., port=...) 等常驻脚本，停止时杀整个进程树<br>3. 「设为自动运行」的文件在 AstrBot 启动/插件重载后自动拉起<br>4. 删除项目只解除登记，不会删除你的文件夹</div>
+        <div class="hint">1. 文件树展示项目内全部文件：.py 可运行；其它文本文件可编辑/删除；图片可预览；二进制文件只展示信息<br>2. 每个项目一个共享控制台（所有运行脚本的输出汇入，带文件名前缀）<br>3. 支持 app.run(host=..., port=...) 等常驻脚本，停止时杀整个进程树<br>4. 「设为自动运行」的文件在 AstrBot 启动/插件重载后自动拉起<br>5. 删除项目只解除登记，不会删除你的文件夹；删除单个文件会真删，请谨慎</div>
       </div>
     </div>
     <!-- 项目视图 -->
@@ -155,8 +155,14 @@ textarea.code{width:100%;min-height:260px;font-family:Consolas,Menlo,monospace;f
               <button class="btn small run" id="btnRunFile" disabled>▶ 运行</button>
               <button class="btn small stop" id="btnStopFile" disabled>■ 停止</button>
               <button class="btn small secondary" id="btnAutoRun" disabled>设为自动运行</button>
+              <button class="btn small danger" id="btnDelFile" disabled>删除文件</button>
             </div>
-            <textarea class="code" id="edCode" spellcheck="false" placeholder="从左侧文件树选择一个 .py 脚本"></textarea>
+            <textarea class="code" id="edCode" spellcheck="false" placeholder="从左侧文件树选择一个文件（任意类型都可编辑，.py 可运行）"></textarea>
+            <div id="previewBox" style="display:none;text-align:center;padding:10px">
+              <img id="previewImg" alt="preview" style="max-width:100%;max-height:52vh;border-radius:8px;background:rgba(128,128,128,.08)"/>
+              <div class="hint" id="previewInfo"></div>
+            </div>
+            <div id="binInfo" class="empty" style="display:none"></div>
           </div>
           <div class="card">
             <h2>控制台输出（本项目共享）

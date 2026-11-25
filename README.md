@@ -6,7 +6,12 @@ AstrBot WebUI 内的**项目文件夹式** Python 脚本挂机面板，交互风
 
 1. **默认目录**：文件浏览与新建项目默认在 `data/plugin_data/astrbot_plugin_script_station/` 下，方便统一管理（浏览对话框可一键跳回默认目录或全盘盘符，也可选本机任意文件夹）。
 2. **添加项目文件夹**：首页填路径或用「浏览…」选择器；**路径留空 = 按项目名在默认目录自动创建文件夹**；浏览框内可直接「＋建文件夹」。
-3. **文件树**：项目标签页左侧列出目录内全部 `.py` 文件（自动跳过 `__pycache__`、`.git`、`venv`、`node_modules` 等），点击即在内置编辑器打开，可编辑保存（Ctrl+S）。
+3. **文件树**：项目标签页左侧展示目录内**全部文件**（自动跳过 `__pycache__`、`.git`、`venv`、`node_modules` 等），按类型显示图标：
+   - 🐍 `.py`：可编辑、可运行/停止、可设自动运行
+   - 📄/⚙️ 文本类（json/yaml/md/txt/html/js…）：可编辑保存（Ctrl+S）、可删除，不可运行
+   - 🖼 图片（png/jpg/gif/webp/bmp/ico）：预览（base64 内嵌，≤5MB）
+   - 📦 二进制：只展示大小信息
+   - 所有文件支持删除（真删磁盘文件，二次确认）；读写沙箱在项目根内
 4. **每项目一个共享控制台**：该项目所有运行脚本的 stdout/stderr 汇入同一控制台，行首带 `[文件名]` 前缀与时间戳，1.2s 增量轮询、自动滚动、清屏，保留最近 3000 行。
 5. **运行/停止常驻脚本**：`python -u 文件` 子进程方式运行，`app.run(host=..., port=...)`、长循环、定时任务等不阻塞 AstrBot。停止时 Windows 用 `taskkill /F /T` 杀整个进程树（兼容 reloader 子进程），Linux/macOS 用进程组 SIGTERM→SIGKILL。支持同项目并行多个脚本，可单独停或「停止全部」。
 6. **自动运行**：文件编辑器里「设为自动运行」，插件加载（AstrBot 启动/重载）时自动拉起这些脚本，实现开机挂机。
@@ -47,12 +52,19 @@ if __name__ == "__main__":
 | `projects/delete` | POST | `{id}` 删除登记（停进程，不删文件） |
 | `browse` | POST | `{path?}` 目录浏览：缺省=默认目录，`""`=盘符 | 
 | `mkdir` | POST | `{path?,name}` 新建子文件夹（缺省父=默认目录） |
-| `files` | POST | `{id}` 项目内 .py 文件树（≤800 个，深度≤6） |
-| `read_file` / `write_file` | POST | `{id,file[,content]}` 项目内读写（防越界） |
+| `files` | POST | `{id}` 项目内全部文件树（≤2000 个，深度≤6） |
+| `read_file` / `write_file` | POST | `{id,file[,content]}` 文本读写（任意类型，防越界；二进制返回 binary 标记） |
+| `delete_file` | POST | `{id,file}` 删除单个文件（真删，仅限项目内普通文件） |
+| `preview` | POST | `{id,file}` 图片预览，返回 `{dataUrl}` base64 |
 | `run` | POST | `{id,file}` 运行脚本文件 |
 | `stop` | POST | `{id[,runId]}` 停止单个/全部 |
 | `logs` | POST | `{id,offset}` 项目控制台增量输出 |
 | `clear_log` | POST | `{id}` 清空控制台 |
+
+## v2.2 变更
+
+- 文件树展示项目内全部文件（不再只列 .py）。
+- 非 .py 文本文件可编辑/保存/删除；图片可预览；二进制文件展示信息；只有 .py 可运行/自动运行；新增 `delete_file`、`preview` 接口。
 
 ## v2.1 变更
 
