@@ -64,7 +64,7 @@ except ImportError:  # 部分版本无 astrbot.api.web：Quart 回退
     request = _ReqProxy()
 
 PLUGIN_ID = "astrbot_plugin_script_station"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 MAX_NAME = 64
 MAX_FILE_BYTES = 200_000   # 单文件文本读写上限
@@ -598,16 +598,21 @@ class ScriptStation(Star):
             return error_response(f"文件不存在: {body.get('file')}")
         try:
             size = os.path.getsize(abs_path)
+            mtime = os.path.getmtime(abs_path)
+            with open(abs_path, "rb") as f:
+                head = f.read(8192)
+            if b"\x00" in head:
+                # 二进制：只报信息不读内容，保证可选中/删除
+                return json_response({"ok": True, "binary": True, "size": size, "mtime": mtime})
             if size > MAX_FILE_BYTES:
-                return error_response(f"文件过大({size}B)，文本读写上限 {MAX_FILE_BYTES}B")
+                # 超大文本：可选中/删除，不支持编辑
+                return json_response({"ok": True, "binary": False, "tooBig": True,
+                                      "size": size, "mtime": mtime})
             with open(abs_path, "rb") as f:
                 raw = f.read()
-            if b"\x00" in raw[:8192]:
-                return json_response({"ok": True, "binary": True, "size": size,
-                                      "mtime": os.path.getmtime(abs_path)})
             return json_response({"ok": True, "binary": False, "size": size,
                                   "content": raw.decode("utf-8", "replace"),
-                                  "mtime": os.path.getmtime(abs_path)})
+                                  "mtime": mtime})
         except Exception as e:
             return error_response(f"读取失败: {e}")
 

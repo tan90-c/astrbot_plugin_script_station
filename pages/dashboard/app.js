@@ -302,6 +302,8 @@ async function selectFile(rel) {
         } else {
           fileStates[key] = { type: "binary", size: r.size };
         }
+      } else if (r.tooBig) {
+        fileStates[key] = { type: "toolarge", size: r.size };
       } else {
         fileStates[key] = { type: "text", code: r.content, dirty: false, size: r.size };
       }
@@ -327,8 +329,9 @@ function renderEditor() {
     $("previewImg").src = s.url;
     $("previewInfo").textContent = `${currentFile} · ${fmtSize(s.size)}（图片预览，不支持编辑）`;
   }
-  $("binInfo").style.display = isBin ? "" : "none";
-  if (isBin) $("binInfo").textContent = `二进制文件（${fmtSize(s.size)}），不支持编辑/预览/运行`;
+  $("binInfo").style.display = isBin || (s && s.type === "toolarge") ? "" : "none";
+  if (isBin) $("binInfo").textContent = `二进制文件（${fmtSize(s.size)}），不支持编辑/预览/运行；仍可删除`;
+  else if (s && s.type === "toolarge") $("binInfo").textContent = `文件过大（${fmtSize(s.size)}，文本编辑上限 200KB），不支持编辑/预览/运行；仍可删除`;
   $("edDirty").textContent = isText && s.dirty ? "● 未保存" : "";
   $("btnSaveFile").disabled = !isText || !s.dirty;
   $("btnDelFile").disabled = !currentFile;
