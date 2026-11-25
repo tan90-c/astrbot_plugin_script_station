@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "description": "脚本库（由面板维护，请勿手动修改）",
+    "type": "list",
+    "default": [],
+    "hint": "每项为 {id,name,code,autoStart,createdAt,updatedAt}。不在本 schema 中的键会在插件重载时被丢弃，因此脚本必须存在这里。"
+  }
+}
